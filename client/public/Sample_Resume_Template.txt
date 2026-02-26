@@ -1,0 +1,19 @@
+[YOUR FULL NAME]
+Email: your.email@example.com
+Phone: +1 123 456 7890
+Linkedin: https://www.linkedin.com/in/yourprofile
+
+CAREER OBJECTIVE:
+Passionate software developer seeking a role to build impactful web applications using modern technologies.
+
+TECHNICAL SKILLS:
+Java, Python, JavaScript, React, Node.js, SQL, Git
+
+EDUCATION:
+B.E. Computer Science, University Name, 2024
+
+EXPERIENCE:
+Software Intern, Tech Corp
+June 2023 - Present
+- Built responsive UI components using React.
+- Optimized backend APIs for performance.

@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+*.db
+*.sqlite
+__pycache__
+admin_v2

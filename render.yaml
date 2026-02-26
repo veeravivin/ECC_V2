@@ -1,0 +1,45 @@
+services:
+  # 1. AI Engine Service (Python FastAPI)
+  - type: web
+    name: ethical-career-ai
+    runtime: docker
+    dockerContext: ai-engine
+    dockerfilePath: Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: GEMINI_API_KEY # User must set this in Render Dashboard
+        sync: false
+      - key: SERP_API_KEY # User must set this in Render Dashboard
+        sync: false
+
+  # 2. Main Web Service (Node.js + React Frontend)
+  - type: web
+    name: ethical-career-web
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: AI_SERVICE_URL
+        value: http://ethical-career-ai:8000
+      - key: REDIS_URL
+        fromService:
+          name: ethical-career-redis
+          type: redis
+          property: connectionString
+      - key: EMAIL_USER # User must set this in Render Dashboard
+        sync: false
+      - key: EMAIL_PASS # User must set this in Render Dashboard
+        sync: false
+    # Note: SQLite DB in /app/server/data will be ephemeral on Free tier.
+    # To persist data, you would need a 'Disk' (Starter plan and above).
+
+  # 3. Redis Instance
+  - type: redis
+    name: ethical-career-redis
+    plan: free
+    ipAllowList: [] # Only allow internal Render services to connect

@@ -1,0 +1,29 @@
+Sending request to AI Engine...
+Status Code: 200
+Response JSON:
+{
+  "final_score": 67,
+  "results": [
+    {
+      "question_idx": 0,
+      "type": "mcq",
+      "is_correct": true,
+      "score": 100,
+      "explanation": "Correct option selected"
+    },
+    {
+      "question_idx": 1,
+      "type": "code",
+      "is_correct": true,
+      "score": 50,
+      "explanation": "AI Grading unavailable, heuristic pass."
+    },
+    {
+      "question_idx": 2,
+      "type": "code",
+      "is_correct": true,
+      "score": 50,
+      "explanation": "AI Grading unavailable, heuristic pass."
+    }
+  ]
+}

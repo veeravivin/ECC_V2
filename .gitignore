@@ -1,0 +1,35 @@
+# Environment Variables (CRITICAL: Do not remove this)
+.env
+.env.local
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Build Outputs
+dist/
+build/
+*.spec
+
+# OS Generated
+.DS_Store
+Thumbs.db
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log
+
+# IDEs
+.vscode/
+.idea/
