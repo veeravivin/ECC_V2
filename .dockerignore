@@ -4,4 +4,3 @@ dist
 *.db
 *.sqlite
 __pycache__
-admin_v2
