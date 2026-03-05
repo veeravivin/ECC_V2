@@ -1,18 +1,12 @@
 # --- Stage 1: Build Client ---
 FROM node:18-alpine AS client_builder
-
 WORKDIR /app
-COPY client/package*.json ./client/
-RUN cd client && npm install
-
-COPY client/ ./client/
-RUN cd client && npm run build
-
+# Copy everything to ensure context is captured
+COPY . .
+RUN cd client && npm install && npm run build
 
 # --- Stage 2: Setup Server & Run ---
 FROM node:18-slim
-
-# Install system dependencies for sqlite3, python, and build tools
 RUN apt-get update && apt-get install -y \
     python3 \
     make \
@@ -21,21 +15,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# Copy everything again
+COPY . .
 
-# Copy server package files and install
-COPY server/package*.json ./server/
+# Install server dependencies
 RUN cd server && npm install --production
 
-# Copy server source
-COPY server/ ./server/
-
-# Copy built client assets from Stage 1
-# Server expects assets in /app/client/dist
+# Move built client assets to the correct location
+# We need to make sure /app/client/dist exists for the server
+RUN mkdir -p /app/client
 COPY --from=client_builder /app/client/dist /app/client/dist
 
-# Expose server port
-EXPOSE 3000
-
-# Start server
 WORKDIR /app/server
+EXPOSE 3000
 CMD ["node", "index.js"]
