@@ -1,9 +1,17 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies if needed (e.g. for some python packages)
-# RUN apt-get update && apt-get install -y --no-install-recommends gcc python3-dev
+# Install system dependencies for building Python packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip
 
 # Copy requirements first for better caching
 COPY requirements.txt .
