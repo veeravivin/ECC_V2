@@ -10,6 +10,11 @@ const path = require('path');
 
 dotenv.config();
 
+console.log("Current Environment Variable Keys:", Object.keys(process.env).filter(k => !k.startsWith('npm_')));
+if (!process.env.DATABASE_URL) {
+    console.warn("⚠️ DATABASE_URL is missing in process.env! Starting with default localhost settings.");
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
