@@ -1,8 +1,5 @@
 fastapi
 uvicorn[standard]
-pandas
-numpy
-scikit-learn
 pydantic
 python-dotenv
 requests
@@ -10,3 +7,4 @@ python-multipart
 pypdf
 google-generativeai
 google-genai
+form-data
