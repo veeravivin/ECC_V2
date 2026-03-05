@@ -1,6 +1,0 @@
-node_modules
-dist
-.git
-*.db
-*.sqlite
-__pycache__
