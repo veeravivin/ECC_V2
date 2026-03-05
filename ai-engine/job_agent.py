@@ -8,7 +8,7 @@ from llm_provider import LLMProvider
 
 class JobSearchAgent:
     def __init__(self):
-        self.api_key = os.getenv("SERPAPI_KEY")
+        self.api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERP_API_KEY")
         self.base_url = "https://serpapi.com/search.json"
         self.llm = LLMProvider()
 

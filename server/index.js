@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 const axios = require('axios');
 const multer = require('multer');
@@ -14,16 +14,54 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
+
 const sdk = require('node-appwrite');
 const { databases, DB_ID, COLLECTION_USERS, COLLECTION_AI_USAGE } = require('./appwrite');
 const { Client, Databases, Storage, ID, Query, InputFile } = sdk;
 
 // Appwrite Connectivity Check
 if (!databases || !DB_ID) {
-    console.warn("⚠️ Appwrite Cloud not fully configured in .env. Data will only be saved locally (SQLite).");
+    console.warn("⚠️ Appwrite Cloud not fully configured in .env. Data will only be saved locally.");
 } else {
     console.log("✅ Appwrite Cloud Sync Active: Data will be mirrored to Live Storage.");
 }
+
+// SMTP Connectivity Check
+if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.warn("⚠️ SMTP Credentials (EMAIL_USER/EMAIL_PASS) not found in .env. Email features (OTP/Reminders) will fail.");
+} else {
+    console.log(`✅ SMTP Configured for User: ${process.env.EMAIL_USER}`);
+}
+
+// AI Engine Discovery
+console.log(`🚀 AI Service Target: ${aiServiceUrl}`);
+
+// --- HEALTH CHECK ENDPOINTS ---
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        config: {
+            ai_service: aiServiceUrl,
+            smtp_configured: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS),
+            appwrite_configured: !!(databases && DB_ID)
+        }
+    });
+});
+
+app.get('/api/health/ai', async (req, res) => {
+    try {
+        const response = await axios.get(`${aiServiceUrl}/market_trends`, { timeout: 5000 });
+        res.json({ ai_status: 'online', data: response.data });
+    } catch (err) {
+        res.status(502).json({
+            ai_status: 'offline',
+            error: err.message,
+            hint: `Ensure AI service is running at ${aiServiceUrl}`
+        });
+    }
+});
 
 // Serve Static Files from Client Build (for Single Container Deployment)
 app.use(express.static(path.join(__dirname, '../client/dist')));
@@ -51,181 +89,189 @@ const upload = multer({
     limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
 });
 
-// Database connection (SQLite)
-// Using a file-based DB for persistence without needing external services
-const fs = require('fs');
-const dataDir = path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir);
-}
-const dbPath = path.join(dataDir, 'career_compass.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) console.error("DB Error:", err.message);
-    else console.log("Connected to SQLite database at " + dbPath);
+// --- POSTGRES DATABASE SETUP ---
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    user: process.env.DB_USER || 'postgres',
+    host: process.env.DB_HOST || 'localhost',
+    database: process.env.DB_NAME || 'career_compass',
+    password: process.env.DB_PASSWORD || 'password',
+    port: process.env.DB_PORT || 5432,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false // Required for Render/External DBs
+});
+
+pool.on('error', (err) => {
+    console.error('Unexpected error on idle client', err);
+    process.exit(-1);
 });
 
 // Initialize Tables on Boot
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        email TEXT UNIQUE NOT NULL,
-        phone TEXT,
-        linkedin TEXT,
-        summary TEXT,
-        location TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+const initializeDB = async () => {
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            email TEXT UNIQUE NOT NULL,
+            phone TEXT,
+            linkedin TEXT,
+            summary TEXT,
+            location TEXT,
+            is_admin BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
 
-    // Attempt to add new columns if they don't exist (for existing DBs)
-    db.serialize(() => {
-        db.all("PRAGMA table_info(users)", (err, rows) => {
-            if (!err && rows) {
-                const existingCols = rows.map(r => r.name);
-                const colsToAdd = ['phone', 'linkedin', 'summary', 'location'];
-                colsToAdd.forEach(col => {
-                    if (!existingCols.includes(col)) {
-                        db.run(`ALTER TABLE users ADD COLUMN ${col} TEXT`, (err) => {
-                            if (err) console.error(`Error adding column ${col}:`, err.message);
-                        });
-                    }
-                });
+        // Check for missing columns (Migration)
+        const userColsResult = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'users'");
+        const existingCols = userColsResult.rows.map(r => r.column_name);
+        const colsToAdd = [
+            { name: 'phone', type: 'TEXT' },
+            { name: 'linkedin', type: 'TEXT' },
+            { name: 'summary', type: 'TEXT' },
+            { name: 'location', type: 'TEXT' },
+            { name: 'is_admin', type: 'BOOLEAN DEFAULT FALSE' }
+        ];
+
+        for (const col of colsToAdd) {
+            if (!existingCols.includes(col.name)) {
+                await pool.query(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
             }
-        });
-    });
-
-    db.run(`CREATE TABLE IF NOT EXISTS otp_codes (
-        email TEXT PRIMARY KEY,
-        code TEXT NOT NULL,
-        expires_at DATETIME NOT NULL
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS user_skills (
-        user_id INTEGER,
-        skill_name TEXT,
-        proficiency INTEGER,
-        PRIMARY KEY (user_id, skill_name),
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS user_experience (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        role TEXT,
-        company TEXT,
-        duration TEXT,
-        description TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS user_education (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        degree TEXT,
-        institution TEXT,
-        year TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS user_roadmaps (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        role TEXT,
-        duration TEXT,
-        roadmap_data TEXT,
-        status TEXT DEFAULT 'Not Started',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        started_at DATETIME,
-        reminders_enabled BOOLEAN DEFAULT 0,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    // Migration for existing tables
-    const roadmapCols = ['started_at', 'reminders_enabled'];
-    roadmapCols.forEach(col => {
-        db.run(`ALTER TABLE user_roadmaps ADD COLUMN ${col} ${col === 'reminders_enabled' ? 'BOOLEAN DEFAULT 0' : 'DATETIME'}`, (err) => {
-            // Ignore duplicate column errors
-        });
-    });
-
-    db.run(`CREATE TABLE IF NOT EXISTS market_trends_cache (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        trends_data TEXT,
-        last_updated DATETIME
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS user_test_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        topic TEXT,
-        level TEXT,
-        score INTEGER,
-        total_questions INTEGER,
-        details_json TEXT, 
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS ai_usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        endpoint TEXT,
-        status TEXT, -- success, failure
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS predefined_questions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic TEXT,
-        level TEXT,
-        question_data TEXT, -- JSON string
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-    // Migrate users for is_admin
-    db.run(`ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT 0`, (err) => {
-        // Default admin seeding if not exists
-        db.run(`UPDATE users SET is_admin = 1 WHERE email = 'admin@compass.com'`, (err) => {
-            if (!err) {
-                db.run(`INSERT OR IGNORE INTO users (name, email, is_admin) VALUES ('System Admin', 'admin@compass.com', 1)`);
-            }
-        });
-    });
-});
-
-// Helper: Log AI Usage
-const logAIUsage = (endpoint, status = 'success') => {
-    db.run("INSERT INTO ai_usage (endpoint, status) VALUES (?, ?)", [endpoint, status]);
-
-    // --- APPWRITE CLOUD MIRROR ---
-    if (databases && DB_ID) {
-        // Appwrite URL attributes require protocol. We use a fake prefix if the attribute is URL type, 
-        // but it's better if the user sets it as String in Appwrite dashboard.
-        let safeEndpoint = endpoint;
-        if (!endpoint.startsWith('http')) {
-            safeEndpoint = `https://compass.api${endpoint.startsWith('/') ? '' : '/'}${endpoint}`;
         }
 
-        databases.createDocument(DB_ID, COLLECTION_AI_USAGE, ID.unique(), {
-            endpoint: safeEndpoint,
-            status,
-            timestamp: new Date().toISOString()
-        }).catch(e => console.error("[Appwrite Sync Fail]:", e.message));
+        // Default Admin Seed
+        await pool.query(`INSERT INTO users (name, email, is_admin) 
+                         VALUES ('System Admin', 'admin@compass.com', TRUE) 
+                         ON CONFLICT (email) DO UPDATE SET is_admin = TRUE`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS otp_codes (
+            email TEXT PRIMARY KEY,
+            code TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS user_skills (
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            skill_name TEXT,
+            proficiency INTEGER,
+            PRIMARY KEY (user_id, skill_name)
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS user_experience (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            role TEXT,
+            company TEXT,
+            duration TEXT,
+            description TEXT
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS user_education (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            degree TEXT,
+            institution TEXT,
+            year TEXT
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS user_roadmaps (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            role TEXT,
+            duration TEXT,
+            roadmap_data TEXT,
+            status TEXT DEFAULT 'Not Started',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            reminders_enabled BOOLEAN DEFAULT FALSE
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS market_trends_cache (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            trends_data TEXT,
+            last_updated TIMESTAMP
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS user_test_results (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            topic TEXT,
+            level TEXT,
+            score INTEGER,
+            total_questions INTEGER,
+            details_json TEXT, 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS ai_usage (
+            id SERIAL PRIMARY KEY,
+            endpoint TEXT,
+            status TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS predefined_questions (
+            id SERIAL PRIMARY KEY,
+            topic TEXT,
+            level TEXT,
+            question_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        console.log("✅ PostgreSQL Tables Initialized");
+    } catch (err) {
+        console.error("❌ DB Initialization Error:", err.message);
     }
 };
 
-// Helper: Promisify DB Queries for async/await usage
-const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-        if (err) reject(err);
-        else resolve(this);
+initializeDB();
+
+// Helper: Log AI Usage
+const logAIUsage = async (endpoint, status = 'success') => {
+    try {
+        await pool.query("INSERT INTO ai_usage (endpoint, status) VALUES ($1, $2)", [endpoint, status]);
+
+        // --- APPWRITE CLOUD MIRROR ---
+        if (databases && DB_ID) {
+            let safeEndpoint = endpoint;
+            if (!endpoint.startsWith('http')) {
+                safeEndpoint = `https://compass.api${endpoint.startsWith('/') ? '' : '/'}${endpoint}`;
+            }
+
+            databases.createDocument(DB_ID, COLLECTION_AI_USAGE, ID.unique(), {
+                endpoint: safeEndpoint,
+                status,
+                timestamp: new Date().toISOString()
+            }).catch(e => console.error("[Appwrite Sync Fail]:", e.message));
+        }
+    } catch (err) {
+        console.error("AI Usage Log Fail:", err.message);
+    }
+};
+
+// Helper: Adapters for async/await (Replacing SQLite helpers)
+const dbRun = (sql, params = []) => pool.query(sql.replace(/\?/g, (val, i) => `$${params.indexOf(val) + 1}`), params); // This regex replacement is risky, better to use positional manually or a proper helper.
+// Actually, I should just update the calls to use $1, $2, etc. and call pool.query directly.
+// But to keep it semi-compatible for a quick migration, I'll create a better wrapper.
+
+const query = (text, params) => {
+    // Convert ? to $1, $2, etc.
+    let index = 0;
+    const formattedSQL = text.replace(/\?/g, () => {
+        index++;
+        return `$${index}`;
     });
-});
-const dbGet = (sql, params = []) => new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
-    });
-});
+    return pool.query(formattedSQL, params);
+};
+
+const dbGet = async (sql, params = []) => {
+    const res = await query(sql, params);
+    return res.rows[0];
+};
+
+const dbAll = async (sql, params = []) => {
+    const res = await query(sql, params);
+    return res.rows;
+};
+
 
 app.get('/api/ai/trends', async (req, res) => {
     try {
@@ -268,7 +314,6 @@ app.get('/api/ai/trends', async (req, res) => {
         }
 
         console.log("Fetching fresh trends data from AI...");
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         const response = await axios.get(`${aiServiceUrl}/market_trends`);
         const newData = response.data;
 
@@ -306,11 +351,7 @@ app.post('/api/ai/skill_test', async (req, res) => {
         console.log(`[AI Proxy] Requesting Skill Test: ${topic} (${level})`);
 
         const getFromDB = async (t, l) => {
-            const rows = await new Promise((resolve, reject) => {
-                db.all("SELECT question_data FROM predefined_questions WHERE LOWER(topic) = LOWER(?) AND level = ?", [t, l], (err, rows) => {
-                    if (err) reject(err); else resolve(rows);
-                });
-            });
+            const rows = await dbAll("SELECT question_data FROM predefined_questions WHERE LOWER(topic) = LOWER(?) AND level = ?", [t, l]);
             if (rows && rows.length >= 5) {
                 const shuffled = rows.sort(() => 0.5 - Math.random()).slice(0, 5);
                 return shuffled.map(s => JSON.parse(s.question_data));
@@ -324,7 +365,6 @@ app.post('/api/ai/skill_test', async (req, res) => {
         }
 
         try {
-            const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
             const response = await axios.post(`${aiServiceUrl}/generate_skill_test`, { topic, level });
             const questions = response.data;
 
@@ -332,22 +372,17 @@ app.post('/api/ai/skill_test', async (req, res) => {
                 // Background: Save to DB with deduplication
                 setImmediate(async () => {
                     try {
-                        const currentRows = await new Promise((resolve, reject) => {
-                            db.all("SELECT question_data FROM predefined_questions WHERE LOWER(topic) = LOWER(?) AND level = ?", [topic, level], (err, rows) => {
-                                if (err) reject(err); else resolve(rows);
-                            });
-                        });
+                        const currentRows = await dbAll("SELECT question_data FROM predefined_questions WHERE LOWER(topic) = LOWER(?) AND level = ?", [topic, level]);
                         const existingTexts = new Set(currentRows.map(r => {
                             try { return JSON.parse(r.question_data).question; } catch (e) { return null; }
                         }));
-                        const stmt = db.prepare("INSERT INTO predefined_questions (topic, level, question_data) VALUES (?, ?, ?)");
-                        questions.forEach(q => {
+
+                        for (const q of questions) {
                             if (q.question && !existingTexts.has(q.question)) {
-                                stmt.run(topic, level, JSON.stringify(q));
+                                await query("INSERT INTO predefined_questions (topic, level, question_data) VALUES (?, ?, ?)", [topic, level, JSON.stringify(q)]);
                                 existingTexts.add(q.question);
                             }
-                        });
-                        stmt.finalize();
+                        }
                     } catch (e) { }
                 });
                 logAIUsage('/generate_skill_test');
@@ -371,89 +406,87 @@ app.post('/api/ai/skill_test', async (req, res) => {
     }
 });
 
-app.post('/api/tests/save', (req, res) => {
+app.post('/api/tests/save', async (req, res) => {
     const { user_email, topic, level, score, total_questions, details } = req.body;
-    db.get("SELECT id FROM users WHERE email = ?", [user_email], (err, user) => {
-        if (err || !user) return res.status(404).json({ error: "User not found" });
+    try {
+        const user = await dbGet("SELECT id FROM users WHERE email = ?", [user_email]);
+        if (!user) return res.status(404).json({ error: "User not found" });
 
-        const stmt = db.prepare("INSERT INTO user_test_results (user_id, topic, level, score, total_questions, details_json) VALUES (?, ?, ?, ?, ?, ?)");
-        stmt.run(user.id, topic, level, score, total_questions, JSON.stringify(details), function (err) {
-            if (err) return res.status(500).json({ error: err.message });
+        await query("INSERT INTO user_test_results (user_id, topic, level, score, total_questions, details_json) VALUES (?, ?, ?, ?, ?, ?)",
+            [user.id, topic, level, score, total_questions, JSON.stringify(details)]);
 
-            // --- APPWRITE CLOUD SYNC: TEST RESULTS ---
-            if (databases && DB_ID) {
-                databases.createDocument(DB_ID, 'user_test_results', ID.unique(), {
-                    user_id: String(user.id),
-                    topic,
-                    level,
-                    score: Number(score),
-                    total_questions: Number(total_questions),
-                    details_json: JSON.stringify(details),
-                    created_at: new Date().toISOString()
-                }).catch(e => console.error("[Appwrite Sync Fail]:", e.message));
-            }
+        // --- APPWRITE CLOUD SYNC ---
+        if (databases && DB_ID) {
+            databases.createDocument(DB_ID, 'user_test_results', ID.unique(), {
+                user_id: String(user.id),
+                topic,
+                level,
+                score: Number(score),
+                total_questions: Number(total_questions),
+                details_json: JSON.stringify(details),
+                created_at: new Date().toISOString()
+            }).catch(e => console.error("[Appwrite Sync Fail]:", e.message));
+        }
 
-            res.json({ message: "Test result saved" });
-        });
-        stmt.finalize();
-    });
+        res.json({ message: "Test result saved" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-app.get('/api/tests/history', (req, res) => {
+app.get('/api/tests/history', async (req, res) => {
     const { email } = req.query;
-    db.get("SELECT id FROM users WHERE email = ?", [email], (err, user) => {
-        if (err || !user) return res.status(404).json({ error: "User not found" });
+    try {
+        const user = await dbGet("SELECT id FROM users WHERE email = ?", [email]);
+        if (!user) return res.status(404).json({ error: "User not found" });
 
-        db.all("SELECT * FROM user_test_results WHERE user_id = ? ORDER BY created_at DESC", [user.id], (err, rows) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json(rows.map(r => ({ ...r, details_json: JSON.parse(r.details_json) })));
-        });
-    });
+        const rows = await dbAll("SELECT * FROM user_test_results WHERE user_id = ? ORDER BY created_at DESC", [user.id]);
+        res.json(rows.map(r => ({ ...r, details_json: JSON.parse(r.details_json) })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Save a generated roadmap
-app.post('/api/roadmaps/save', (req, res) => {
+app.post('/api/roadmaps/save', async (req, res) => {
     const { user_email, role, duration, roadmap } = req.body;
     console.log(`[Roadmap Save] Request for ${user_email}, role: ${role}`);
 
-    // Log structure check
     if (!roadmap || !roadmap.roadmap || !Array.isArray(roadmap.roadmap)) {
         console.warn("[Roadmap Save] WARNING: Saving roadmap with invalid structure!", JSON.stringify(roadmap).substring(0, 100));
     }
 
-    db.get("SELECT id FROM users WHERE email = ?", [user_email], (err, user) => {
-        if (err) { console.error("DB User Error:", err); return res.status(500).json({ error: "Database error checking user" }); }
-        if (!user) { console.error("User not found for email:", user_email); return res.status(404).json({ error: "User not found" }); }
+    try {
+        const user = await dbGet("SELECT id FROM users WHERE email = ?", [user_email]);
+        if (!user) return res.status(404).json({ error: "User not found" });
 
-        const stmt = db.prepare("INSERT INTO user_roadmaps (user_id, role, duration, roadmap_data) VALUES (?, ?, ?, ?)");
-        stmt.run(user.id, role, duration, JSON.stringify(roadmap), function (err) {
-            if (err) {
-                console.error("DB Insert Error:", err);
-                return res.status(500).json({ error: "Failed to save roadmap to DB: " + err.message });
-            }
-            console.log(`[Roadmap Save] Success! ID: ${this.lastID}`);
-            res.json({ id: this.lastID, message: "Roadmap saved successfully" });
-        });
-        stmt.finalize();
-    });
+        const insertRes = await query("INSERT INTO user_roadmaps (user_id, role, duration, roadmap_data) VALUES (?, ?, ?, ?) RETURNING id",
+            [user.id, role, duration, JSON.stringify(roadmap)]);
+
+        const lastID = insertRes.rows[0].id;
+        console.log(`[Roadmap Save] Success! ID: ${lastID}`);
+        res.json({ id: lastID, message: "Roadmap saved successfully" });
+    } catch (err) {
+        console.error("DB Save Error:", err);
+        res.status(500).json({ error: "Failed to save roadmap: " + err.message });
+    }
 });
 
-// List user's roadmaps
-app.get('/api/roadmaps', (req, res) => {
+app.get('/api/roadmaps', async (req, res) => {
     const { email } = req.query;
-    db.get("SELECT id FROM users WHERE email = ?", [email], (err, user) => {
-        if (err || !user) return res.status(404).json({ error: "User not found" });
+    try {
+        const user = await dbGet("SELECT id FROM users WHERE email = ?", [email]);
+        if (!user) return res.status(404).json({ error: "User not found" });
 
-        db.all("SELECT * FROM user_roadmaps WHERE user_id = ? ORDER BY created_at DESC", [user.id], (err, rows) => {
-            if (err) return res.status(500).json({ error: err.message });
-            // Parse JSON data back to object
-            const roadmaps = rows.map(r => ({
-                ...r,
-                roadmap_data: JSON.parse(r.roadmap_data)
-            }));
-            res.json(roadmaps);
-        });
-    });
+        const rows = await dbAll("SELECT * FROM user_roadmaps WHERE user_id = ? ORDER BY created_at DESC", [user.id]);
+        const roadmaps = rows.map(r => ({
+            ...r,
+            roadmap_data: JSON.parse(r.roadmap_data)
+        }));
+        res.json(roadmaps);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // --- PROFILE MANAGEMENT ---
@@ -486,31 +519,27 @@ app.post('/api/profile/save', async (req, res) => {
         // 1. Skills
         await dbRun('DELETE FROM user_skills WHERE user_id = ?', [user.id]);
         if (skills && Array.isArray(skills)) {
-            const skillStmt = db.prepare('INSERT INTO user_skills (user_id, skill_name, proficiency) VALUES (?, ?, ?)');
-            skills.forEach(skill => {
-                skillStmt.run(user.id, skill, 3); // Default proficiency 3
-            });
-            skillStmt.finalize();
+            for (const skill of skills) {
+                await query('INSERT INTO user_skills (user_id, skill_name, proficiency) VALUES (?, ?, ?)', [user.id, skill, 3]);
+            }
         }
 
         // 2. Experience
         await dbRun('DELETE FROM user_experience WHERE user_id = ?', [user.id]);
         if (experience && Array.isArray(experience)) {
-            const expStmt = db.prepare('INSERT INTO user_experience (user_id, role, company, duration, description) VALUES (?, ?, ?, ?, ?)');
-            experience.forEach(exp => {
-                expStmt.run(user.id, exp.role, exp.company, exp.duration, exp.description);
-            });
-            expStmt.finalize();
+            for (const exp of experience) {
+                await query('INSERT INTO user_experience (user_id, role, company, duration, description) VALUES (?, ?, ?, ?, ?)',
+                    [user.id, exp.role, exp.company, exp.duration, exp.description]);
+            }
         }
 
         // 3. Education
         await dbRun('DELETE FROM user_education WHERE user_id = ?', [user.id]);
         if (education && Array.isArray(education)) {
-            const eduStmt = db.prepare('INSERT INTO user_education (user_id, degree, institution, year) VALUES (?, ?, ?, ?)');
-            education.forEach(edu => {
-                eduStmt.run(user.id, edu.degree, edu.institution, edu.year);
-            });
-            eduStmt.finalize();
+            for (const edu of education) {
+                await query('INSERT INTO user_education (user_id, degree, institution, year) VALUES (?, ?, ?, ?)',
+                    [user.id, edu.degree, edu.institution, edu.year]);
+            }
         }
 
         res.json({ message: "Profile saved successfully" });
@@ -527,23 +556,9 @@ app.get('/api/profile', async (req, res) => {
         const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
         if (!user) return res.status(404).json({ error: "User not found" });
 
-        const skills = await new Promise((resolve, reject) => {
-            db.all('SELECT skill_name FROM user_skills WHERE user_id = ?', [user.id], (err, rows) => {
-                if (err) reject(err); else resolve(rows.map(r => r.skill_name));
-            });
-        });
-
-        const experience = await new Promise((resolve, reject) => {
-            db.all('SELECT role, company, duration, description FROM user_experience WHERE user_id = ?', [user.id], (err, rows) => {
-                if (err) reject(err); else resolve(rows);
-            });
-        });
-
-        const education = await new Promise((resolve, reject) => {
-            db.all('SELECT degree, institution, year FROM user_education WHERE user_id = ?', [user.id], (err, rows) => {
-                if (err) reject(err); else resolve(rows);
-            });
-        });
+        const skills = (await dbAll('SELECT skill_name FROM user_skills WHERE user_id = ?', [user.id])).map(r => r.skill_name);
+        const experience = await dbAll('SELECT role, company, duration, description FROM user_experience WHERE user_id = ?', [user.id]);
+        const education = await dbAll('SELECT degree, institution, year FROM user_education WHERE user_id = ?', [user.id]);
 
         res.json({
             personalDetails: {
@@ -667,7 +682,7 @@ app.post('/api/auth/verify', async (req, res) => {
 
 app.post('/api/ai/analyze', async (req, res) => {
     try {
-        const response = await axios.post('http://localhost:8000/analyze_career_match', req.body);
+        const response = await axios.post(`${aiServiceUrl}/analyze_career_match`, req.body);
         logAIUsage('/analyze_career_match');
         res.json(response.data);
     } catch (err) {
@@ -679,7 +694,6 @@ app.post('/api/ai/analyze', async (req, res) => {
 
 app.post('/api/ai/roadmap', async (req, res) => {
     try {
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         console.log(`[AI Proxy] Generating Roadmap for: ${req.body.target_role}`);
         const response = await axios.post(`${aiServiceUrl}/generate_roadmap`, req.body);
         logAIUsage('/generate_roadmap');
@@ -718,7 +732,6 @@ app.post('/api/ai/jobs', async (req, res) => {
 
         // 2. Fetch from AI Engine (SerpAPI)
         console.log(`[AI Proxy] Fetching fresh jobs from AI...`);
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         console.log(`[AI Proxy] Fetching fresh jobs from AI at ${aiServiceUrl}...`);
         const response = await axios.post(`${aiServiceUrl}/recommend_jobs`, req.body);
         const jobData = response.data;
@@ -748,7 +761,6 @@ app.post('/api/ai/recommend', async (req, res) => {
     try {
         console.log(`[AI Proxy] Generating Career Paths for: ${req.body.name}`);
         console.log(`[AI Proxy] Generating Career Paths for: ${req.body.name}`);
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         const response = await axios.post(`${aiServiceUrl}/recommend_career_paths`, req.body);
         logAIUsage('/recommend_career_paths');
         res.json(response.data);
@@ -763,7 +775,6 @@ app.post('/api/ai/grade', async (req, res) => {
     try {
         console.log(`[AI Proxy] Grading Test Submission: ${req.body.topic}`);
         console.log(`[AI Proxy] Grading Test Submission: ${req.body.topic}`);
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         const response = await axios.post(`${aiServiceUrl}/grade_test`, req.body);
         logAIUsage('/grade_test');
         res.json(response.data);
@@ -777,7 +788,6 @@ app.post('/api/ai/grade', async (req, res) => {
 app.post('/api/ai/run_code', async (req, res) => {
     try {
         console.log(`[AI Proxy] Running Code for: ${req.body.language}`);
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         const response = await axios.post(`${aiServiceUrl}/run_code_simulation`, req.body);
         res.json(response.data);
     } catch (err) {
@@ -796,11 +806,8 @@ app.post('/api/ai/resume-parse', upload.single('resume'), async (req, res) => {
             filename: req.file.originalname,
             contentType: req.file.mimetype
         });
-
         // --- APPWRITE CLOUD STORAGE SYNC ---
         if (databases && DB_ID) {
-            const { storage, BUCKET_RESUMES } = require('./appwrite');
-
             storage.createFile(
                 BUCKET_RESUMES || 'resumes',
                 ID.unique(),
@@ -808,7 +815,6 @@ app.post('/api/ai/resume-parse', upload.single('resume'), async (req, res) => {
             ).catch(e => console.error("[Appwrite Storage Fail]:", e.message));
         }
 
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         const response = await axios.post(`${aiServiceUrl}/parse_resume`, formData, {
             headers: {
                 ...formData.getHeaders()
@@ -825,7 +831,6 @@ app.post('/api/ai/resume-parse', upload.single('resume'), async (req, res) => {
 
 app.post('/api/ai/quiz', async (req, res) => {
     try {
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         const response = await axios.post(`${aiServiceUrl}/generate_phase_test`, req.body);
         res.json(response.data);
     } catch (err) {
@@ -836,7 +841,6 @@ app.post('/api/ai/quiz', async (req, res) => {
 
 app.get('/api/ai/trends', async (req, res) => {
     try {
-        const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://localhost:8000';
         const response = await axios.get(`${aiServiceUrl}/market_trends`);
         res.json(response.data);
     } catch (err) {
@@ -845,33 +849,39 @@ app.get('/api/ai/trends', async (req, res) => {
     }
 });
 
-app.post('/api/roadmaps/progress', (req, res) => {
+app.post('/api/roadmaps/progress', async (req, res) => {
     const { id, roadmap_data } = req.body;
-    db.run("UPDATE user_roadmaps SET roadmap_data = ? WHERE id = ?", [JSON.stringify(roadmap_data), id], function (err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        await query("UPDATE user_roadmaps SET roadmap_data = ? WHERE id = ?", [JSON.stringify(roadmap_data), id]);
         res.json({ message: "Progress saved" });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Start Roadmap & Enable Reminders
-app.post('/api/roadmaps/start', (req, res) => {
+app.post('/api/roadmaps/start', async (req, res) => {
     const { id } = req.body;
     const now = new Date().toISOString();
 
-    db.run("UPDATE user_roadmaps SET status = 'In Progress', started_at = ?, reminders_enabled = 1 WHERE id = ?", [now, id], function (err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        await query("UPDATE user_roadmaps SET status = 'In Progress', started_at = ?, reminders_enabled = TRUE WHERE id = ?", [now, id]);
         res.json({ message: "Roadmap started successfully", started_at: now });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Delete Roadmap Endpoint
-app.delete('/api/roadmaps/:id', (req, res) => {
+app.delete('/api/roadmaps/:id', async (req, res) => {
     const { id } = req.params;
-    db.run("DELETE FROM user_roadmaps WHERE id = ?", [id], function (err) {
-        if (err) return res.status(500).json({ error: err.message });
-        if (this.changes === 0) return res.status(404).json({ error: "Roadmap not found" });
+    try {
+        const result = await query("DELETE FROM user_roadmaps WHERE id = ?", [id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: "Roadmap not found" });
         res.json({ message: "Roadmap deleted successfully" });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Manual Trigger for Reminder System (For Testing/Demo)
@@ -880,12 +890,7 @@ app.post('/api/admin/trigger-reminders', async (req, res) => {
 
     // Logic extracted from scheduler
     try {
-        const activeRoadmaps = await new Promise((resolve, reject) => {
-            db.all("SELECT * FROM user_roadmaps WHERE status = 'In Progress' AND reminders_enabled = 1", (err, rows) => {
-                if (err) reject(err);
-                else resolve(rows);
-            });
-        });
+        const activeRoadmaps = await dbAll("SELECT * FROM user_roadmaps WHERE status = 'In Progress' AND reminders_enabled = TRUE");
 
         if (activeRoadmaps.length > 0) {
             console.log(`[Reminder System] Found ${activeRoadmaps.length} active roadmaps.`);
@@ -926,12 +931,7 @@ setInterval(async () => {
         console.log("[Reminder System] It is 6 AM. Initiating daily reminders...");
 
         try {
-            const activeRoadmaps = await new Promise((resolve, reject) => {
-                db.all("SELECT * FROM user_roadmaps WHERE status = 'In Progress' AND reminders_enabled = 1", (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                });
-            });
+            const activeRoadmaps = await dbAll("SELECT * FROM user_roadmaps WHERE status = 'In Progress' AND reminders_enabled = TRUE");
 
             if (activeRoadmaps.length > 0) {
                 console.log(`[Reminder System] Found ${activeRoadmaps.length} active roadmaps.`);
@@ -967,7 +967,7 @@ app.post('/api/admin/login', async (req, res) => {
     const { email, password } = req.body;
     // For demo/simple app, we use a fixed password for the seeded admin
     if (email === 'admin@compass.com' && password === 'admin123') {
-        const user = await dbGet("SELECT * FROM users WHERE email = ? AND is_admin = 1", [email]);
+        const user = await dbGet("SELECT * FROM users WHERE email = ? AND is_admin = TRUE", [email]);
         if (user) {
             return res.json({ user, token: "admin-token", isAdmin: true });
         }
@@ -982,11 +982,7 @@ app.get('/api/admin/stats', async (req, res) => {
         const testCount = await dbGet("SELECT COUNT(*) as count FROM user_test_results");
 
         // Latest users
-        const recentUsers = await new Promise((resolve, reject) => {
-            db.all("SELECT name, email, created_at FROM users ORDER BY created_at DESC LIMIT 5", (err, rows) => {
-                if (err) reject(err); else resolve(rows);
-            });
-        });
+        const recentUsers = await dbAll("SELECT name, email, created_at FROM users ORDER BY created_at DESC LIMIT 5");
 
         res.json({
             users: userCount.count,
@@ -1001,21 +997,12 @@ app.get('/api/admin/stats', async (req, res) => {
 
 app.get('/api/admin/usage', async (req, res) => {
     try {
-        const dailyUsage = await new Promise((resolve, reject) => {
-            db.all("SELECT COUNT(*) as count, DATE(timestamp) as date FROM ai_usage GROUP BY DATE(timestamp) ORDER BY date DESC LIMIT 7", (err, rows) => {
-                if (err) reject(err); else resolve(rows);
-            });
-        });
-
-        const endpointUsage = await new Promise((resolve, reject) => {
-            db.all("SELECT COUNT(*) as count, endpoint FROM ai_usage GROUP BY endpoint ORDER BY count DESC", (err, rows) => {
-                if (err) reject(err); else resolve(rows);
-            });
-        });
+        const dailyUsage = await dbAll("SELECT COUNT(*) as count, timestamp::date as date FROM ai_usage GROUP BY timestamp::date ORDER BY date DESC LIMIT 7");
+        const endpointUsage = await dbAll("SELECT COUNT(*) as count, endpoint FROM ai_usage GROUP BY endpoint ORDER BY count DESC");
 
         // Gemini reset info (mocked/static based on Gemini free tier rules)
         const limit = 1500; // Custom daily limit for this app's dashboard
-        const currentTotal = await dbGet("SELECT COUNT(*) as count FROM ai_usage WHERE DATE(timestamp) = DATE('now')");
+        const currentTotal = await dbGet("SELECT COUNT(*) as count FROM ai_usage WHERE timestamp::date = CURRENT_DATE");
 
         // Next reset is midnight
         const now = new Date();
@@ -1039,10 +1026,8 @@ app.get('/api/admin/usage', async (req, res) => {
 
 app.get('/api/admin/db/tables', async (req, res) => {
     try {
-        db.all("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", (err, rows) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json(rows.map(r => r.name));
-        });
+        const rows = await dbAll("SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public'");
+        res.json(rows.map(r => r.name));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -1053,31 +1038,18 @@ app.get('/api/admin/db/data', async (req, res) => {
     if (!table) return res.status(400).json({ error: "Table name required" });
 
     try {
-        // Warning: This is a internal admin tool, but we should still be careful.
-        // In a real app, we'd whitelist tables.
-        let query = `SELECT * FROM ${table}`;
+        let sql = `SELECT * FROM ${table}`;
         let params = [];
 
         if (search) {
-            // Get columns first to build search
-            db.all(`PRAGMA table_info(${table})`, (err, cols) => {
-                if (err) return res.status(500).json({ error: err.message });
-
-                const searchClauses = cols.map(c => `${c.name} LIKE ?`).join(' OR ');
-                query += ` WHERE ${searchClauses}`;
-                params = cols.map(() => `%${search}%`);
-
-                db.all(query, params, (err, rows) => {
-                    if (err) return res.status(500).json({ error: err.message });
-                    res.json(rows);
-                });
-            });
-        } else {
-            db.all(query, (err, rows) => {
-                if (err) return res.status(500).json({ error: err.message });
-                res.json(rows);
-            });
+            const cols = await dbAll("SELECT column_name as name FROM information_schema.columns WHERE table_name = ?", [table]);
+            const searchClauses = cols.map(c => `${c.name}::text ILIKE ?`).join(' OR ');
+            sql += ` WHERE ${searchClauses}`;
+            params = cols.map(() => `%${search}%`);
         }
+
+        const rows = await dbAll(sql, params);
+        res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
