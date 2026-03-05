@@ -2,18 +2,23 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install minimal build tools
+# Install minimal build tools for Python
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# Copy requirements from wherever they are
+COPY requirements.txt . 2>/dev/null || COPY ai-engine/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy everything in the ai-engine folder
+# Copy the AI code
 COPY . .
+
+# If we are building from the root, we need to move into the ai-engine folder to find main.py
+# Otherwise, we stay in /app
+RUN if [ -d "ai-engine" ]; then mv ai-engine/* . && rm -rf ai-engine; fi
 
 EXPOSE 8000
 
