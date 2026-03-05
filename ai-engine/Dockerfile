@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements from wherever they are
-COPY requirements.txt . 2>/dev/null || COPY ai-engine/requirements.txt .
+# Copy requirements from the ai-engine directory
+COPY ai-engine/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
