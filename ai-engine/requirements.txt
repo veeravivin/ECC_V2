@@ -7,4 +7,4 @@ python-multipart
 pypdf
 google-generativeai
 google-genai
-form-data
+httpx
